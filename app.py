@@ -501,42 +501,47 @@ def get_query_history_suggestions(limit: int = 5) -> list:
     return list(reversed(user_queries))[:limit]
 
 def query_documentation(query: str, top_k: int = 4) -> list:
-    """Query LiveKit documentation using MCP server."""
+    """Query LiveKit documentation directly from Pinecone."""
     try:
-        import subprocess
+        from langchain_huggingface import HuggingFaceEmbeddings
+        from langchain_pinecone import Pinecone
+        import os
+        from dotenv import load_dotenv
         
-        # Call mcp_server_standard.py as subprocess
-        result = subprocess.run(
-            [sys.executable, "mcp_server_standard.py", "search", query, str(top_k)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            encoding='utf-8',
-            errors='replace'
+        load_dotenv()
+        
+        # Initialize embeddings
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
         
-        if result.returncode != 0:
-            st.warning(f"Search: {result.stderr if result.stderr else 'No results'}")
+        # Get Pinecone index name
+        pinecone_index = os.getenv("PINECONE_INDEX_NAME") or os.getenv("PINECONE_INDEX", "livekit-docs")
+        
+        # Initialize vector store
+        vector_store = Pinecone(
+            index_name=pinecone_index,
+            embedding=embeddings
+        )
+        
+        # Search documentation
+        results = vector_store.similarity_search(query, k=top_k)
+        
+        if not results:
+            st.warning("No relevant documentation found. Try a different search term.")
             return []
         
-        # Parse output
-        output = result.stdout.strip()
-        if not output:
-            return []
+        # Format results
+        formatted_docs = []
+        for i, doc in enumerate(results, 1):
+            formatted = f"**Document {i}:**\n{doc.page_content}\n"
+            if doc.metadata:
+                source = doc.metadata.get('source', 'Unknown')
+                formatted += f"\n📌 Source: {source}"
+            formatted_docs.append(formatted)
         
-        docs = []
-        for doc_section in output.split("---"):
-            doc_section = doc_section.strip()
-            if doc_section and "Document" in doc_section:
-                docs.append(doc_section)
+        return formatted_docs
         
-        return docs if docs else []
-    except subprocess.TimeoutExpired:
-        st.error("⏱️ Search timed out (>60s)")
-        return []
-    except FileNotFoundError:
-        st.error("❌ mcp_server_standard.py not found")
-        return []
     except Exception as e:
         st.warning(f"Search error: {str(e)}")
         return []

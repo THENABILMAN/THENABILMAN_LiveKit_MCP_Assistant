@@ -1,27 +1,38 @@
 """
 Standard MCP Server with LangChain Integration
 Model Context Protocol implementation for LiveKit Documentation Search
+Using proper stdio-based communication (Conventional MCP)
 """
 
 import os
 import sys
+import asyncio
 import logging
 from typing import Any
 from dotenv import load_dotenv
 
 # MCP imports
 from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent, CallToolResult
 import mcp.types as types
+from mcp.server.models import InitializationOptions
 
 # LangChain imports
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import Pinecone
 
+# Tavily imports
+from tavily import TavilyClient
+
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging (output to stderr to not interfere with MCP protocol on stdout)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stderr
+)
 logger = logging.getLogger(__name__)
 
 # Initialize MCP Server
@@ -30,10 +41,12 @@ mcp_server = Server("livekit-assistant")
 # API Keys
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME") or os.getenv("PINECONE_INDEX", "livekit-docs")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
 # Lazy loading globals
 _embeddings = None
 _vector_store = None
+_tavily_client = None
 
 def get_embeddings():
     """Get or create embeddings model (lazy load)."""
@@ -58,44 +71,41 @@ def get_vector_store():
         logger.info("✓ Pinecone vector store ready")
     return _vector_store
 
+def get_tavily_client():
+    """Get or create Tavily client (lazy load)."""
+    global _tavily_client
+    if _tavily_client is None:
+        if not TAVILY_API_KEY:
+            logger.warning("TAVILY_API_KEY not set")
+            return None
+        _tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+        logger.info("✓ Tavily client ready")
+    return _tavily_client
+
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available MCP tools."""
     return [
         Tool(
             name="search_documentation",
-            description="Search LiveKit documentation using semantic search. Returns relevant documentation excerpts.",
+            description="Search LiveKit documentation",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query for LiveKit documentation"
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of results to return (default: 4)",
-                        "default": 4
-                    }
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer"}
                 },
                 "required": ["query"]
             }
         ),
         Tool(
             name="search_web",
-            description="Search the web for information using Tavily API.",
+            description="Search the web",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query for web search"
-                    },
-                    "topic": {
-                        "type": "string",
-                        "description": "Search topic type: 'general' or 'news'",
-                        "default": "general"
-                    }
+                    "query": {"type": "string"},
+                    "topic": {"type": "string"}
                 },
                 "required": ["query"]
             }
@@ -103,14 +113,42 @@ async def list_tools() -> list[Tool]:
     ]
 
 @mcp_server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent | types.ImageContent]:
+async def call_tool(name: str, arguments: dict) -> CallToolResult:
     """Execute MCP tools."""
+    logger.info(f"========== TOOL CALL ==========")
+    logger.info(f"Tool name: {name}")
+    logger.info(f"Arguments type: {type(arguments)}")
+    logger.info(f"Arguments: {arguments}")
+    logger.info(f"==============================")
+    
     try:
         if name == "search_documentation":
+            # Validate arguments
+            if arguments is None:
+                logger.error("Arguments is None!")
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: Arguments is None")],
+                    isError=True
+                )
+                
+            if not isinstance(arguments, dict):
+                logger.error(f"Arguments is not a dict, it's {type(arguments)}: {arguments}")
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"Error: Arguments must be a dict, got {type(arguments)}")],
+                    isError=True
+                )
+            
+            if "query" not in arguments:
+                logger.error(f"Missing 'query' in arguments: {list(arguments.keys())}")
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: Missing required 'query' parameter")],
+                    isError=True
+                )
+            
             query = arguments.get("query", "")
             top_k = arguments.get("top_k", 4)
             
-            logger.info(f"Searching documentation for: {query}")
+            logger.info(f"Searching documentation for: {query} (top_k={top_k})")
             
             try:
                 vector_store = get_vector_store()
@@ -119,10 +157,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent | type
                 logger.info(f"Found {len(results)} results")
                 
                 if not results:
-                    return [TextContent(
-                        type="text",
-                        text="No relevant documentation found for your query. Please try a different search term or make sure the documentation index is populated."
-                    )]
+                    return CallToolResult(
+                        content=[TextContent(
+                            type="text",
+                            text="No relevant documentation found for your query. Please try a different search term or make sure the documentation index is populated."
+                        )]
+                    )
                 
                 # Format results
                 formatted_results = []
@@ -133,14 +173,17 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent | type
                     formatted_results.append(content)
                 
                 response_text = "\n---\n".join(formatted_results)
-                return [TextContent(type="text", text=response_text)]
+                return CallToolResult(content=[TextContent(type="text", text=response_text)])
                 
             except Exception as e:
                 logger.error(f"Vector store error: {str(e)}", exc_info=True)
-                return [TextContent(
-                    type="text",
-                    text=f"Error accessing documentation database: {str(e)}\n\nPlease run: python ingest_docs.py"
-                )]
+                return CallToolResult(
+                    content=[TextContent(
+                        type="text",
+                        text=f"Error accessing documentation database: {str(e)}\n\nPlease run: python ingest_comprehensive.py"
+                    )],
+                    isError=True
+                )
         
         elif name == "search_web":
             query = arguments.get("query", "")
@@ -148,92 +191,92 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent | type
             
             logger.info(f"Searching web for: {query}")
             
-            from tavily import TavilyClient
-            
-            tavily_api_key = os.getenv("TAVILY_API_KEY")
-            if not tavily_api_key:
-                return [TextContent(
-                    type="text",
-                    text="Tavily API key not configured. Web search unavailable."
-                )]
-            
-            client = TavilyClient(api_key=tavily_api_key)
-            response = client.search(query=query, topic=topic, max_results=4)
-            
-            if "results" not in response or not response["results"]:
-                return [TextContent(
-                    type="text",
-                    text="No web search results found."
-                )]
-            
-            # Format web results
-            formatted_results = []
-            for i, result in enumerate(response["results"], 1):
-                content = f"**Result {i}: {result.get('title', 'N/A')}**\n"
-                content += f"{result.get('content', 'No content')}\n"
-                content += f"Source: {result.get('url', 'N/A')}\n"
-                formatted_results.append(content)
-            
-            response_text = "\n---\n".join(formatted_results)
-            return [TextContent(type="text", text=response_text)]
+            try:
+                client = get_tavily_client()
+                if not client:
+                    return CallToolResult(
+                        content=[TextContent(
+                            type="text",
+                            text="Web search is not configured. Set TAVILY_API_KEY environment variable."
+                        )],
+                        isError=True
+                    )
+                
+                response = client.search(
+                    query=query,
+                    topic=topic,
+                    max_results=5
+                )
+                
+                if not response or not response.get("results"):
+                    return CallToolResult(
+                        content=[TextContent(
+                            type="text",
+                            text="No web search results found."
+                        )]
+                    )
+                
+                # Format results
+                formatted_results = []
+                for i, result in enumerate(response["results"], 1):
+                    content = f"**Result {i}:**\n"
+                    content += f"Title: {result.get('title', 'N/A')}\n"
+                    content += f"URL: {result.get('url', 'N/A')}\n"
+                    content += f"Content: {result.get('content', 'N/A')}\n"
+                    formatted_results.append(content)
+                
+                response_text = "\n---\n".join(formatted_results)
+                return CallToolResult(content=[TextContent(type="text", text=response_text)])
+                
+            except Exception as e:
+                logger.error(f"Web search error: {str(e)}", exc_info=True)
+                return CallToolResult(
+                    content=[TextContent(
+                        type="text",
+                        text=f"Web search error: {str(e)}"
+                    )],
+                    isError=True
+                )
         
         else:
-            return [TextContent(
-                type="text",
-                text=f"Unknown tool: {name}"
-            )]
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=f"Unknown tool: {name}"
+                )]
+            )
     
     except Exception as e:
         logger.error(f"Error calling tool {name}: {str(e)}")
-        return [TextContent(
-            type="text",
-            text=f"Error: {str(e)}"
-        )]
+        return CallToolResult(
+            content=[TextContent(
+                type="text",
+                text=f"Error: {str(e)}"
+            )],
+            isError=True
+        )
 
 async def main():
-    """Run the MCP server."""
-    logger.info("Starting LiveKit Assistant MCP Server...")
+    """Main entry point for MCP server."""
+    logger.info("🚀 Starting MCP Server on stdio...")
     logger.info("✅ MCP Server initialized with:")
     logger.info("   - search_documentation tool")
     logger.info("   - search_web tool")
     logger.info("Ready for client connections...")
     
-    # Keep running
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("MCP Server shutting down...")
+    # Import server components
+    from mcp.server.stdio import stdio_server
+    
+    async with stdio_server() as (read_stream, write_stream):
+        await mcp_server.run(
+            read_stream, 
+            write_stream,
+            InitializationOptions(
+                server_name="livekit-assistant",
+                server_version="1.0.0",
+                capabilities={}
+            )
+        )
 
 if __name__ == "__main__":
-    import asyncio
-    
-    # Handle command-line mode for direct queries
-    if len(sys.argv) > 2 and sys.argv[1] == "search":
-        query = sys.argv[2]
-        top_k = int(sys.argv[3]) if len(sys.argv) > 3 else 4
-        
-        async def direct_search():
-            try:
-                vector_store = get_vector_store()
-                results = vector_store.similarity_search(query, k=top_k)
-                
-                if not results:
-                    print("No relevant documentation found.")
-                    return
-                
-                formatted_results = []
-                for i, doc in enumerate(results, 1):
-                    content = f"**Document {i}:**\n{doc.page_content}\n"
-                    if doc.metadata:
-                        content += f"\nSource: {doc.metadata.get('source', 'Unknown')}\n"
-                    formatted_results.append(content)
-                
-                print("\n---\n".join(formatted_results))
-            except Exception as e:
-                print(f"Error: {str(e)}", file=sys.stderr)
-                sys.exit(1)
-        
-        asyncio.run(direct_search())
-    else:
-        asyncio.run(main())
+    asyncio.run(main())
